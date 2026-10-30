@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>QQQ 4小时 · 三推形态</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #131722; color: #d1d4dc; overflow: hidden;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 8px 16px; display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .price { font-size: 16px; font-weight: 600; }
+  #ohlc { font-size: 13px; color: #9598a1; }
+  #ohlc b { font-weight: 500; }
+  .toggles { margin-left: auto; font-size: 13px; display: flex; gap: 14px; align-items: center; }
+  .toggles label { cursor: pointer; user-select: none; }
+  .toggles input[type=number], .toggles select { width: 52px; background: #1e222d; color: #d1d4dc;
+    border: 1px solid #363a45; border-radius: 3px; padding: 2px 4px; }
+  #info { padding: 0 16px 6px; font-size: 13px; color: #4a7dff; min-height: 18px; }
+  #wrap { flex: 1; min-height: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #err { padding: 40px; color: #ef5350; font-size: 15px; line-height: 1.8; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">QQQ · 4小时</h1>
+  <span class="price" id="last"></span>
+  <span id="ohlc"></span>
+  <div class="toggles">
+    <label>方向 <select id="dir"><option value="auto">自动</option><option value="down">下跌找底</option><option value="up">上涨找顶</option></select></label>
+    <label title="波段反转超过该幅度才算一个新的高/低点">ZigZag 阈值 <input type="number" id="th" value="2" min="0.5" max="10" step="0.5">%</label>
+    <label><input type="checkbox" id="tZig"> ZigZag</label>
+    <label><input type="checkbox" id="tWedge" checked> 楔形/水平线</label>
+    <label><input type="checkbox" id="tPush" checked> 三推折线</label>
+    <label><input type="checkbox" id="tProj" checked> 推演路径</label>
+  </div>
+</header>
+<div id="info"></div>
+<div id="wrap"><canvas id="c"></canvas></div>
+
+<!-- 真实数据：先运行 python fetch_data.py 生成 data.js -->
+<script src="data.js"></script>
+<script>
+const UP = '#ef5350', DOWN = '#26a69a', BLUE = '#4a7dff', GREY = '#9a9ea8', ORANGE = '#f0a030';  // 红涨绿跌
+const FUTURE = 26;  // 右侧留给推演路径的空位（根数）
+
+const bars = window.BARS || [];
+if (!bars.length) {
+  document.getElementById('wrap').innerHTML =
+    '<div id="err">没有找到 data.js。请先在本目录运行：<br><code>python fetch_data.py</code><br>然后刷新页面。</div>';
+  throw new Error('no data');
+}
+const N = bars.length;
+document.getElementById('title').textContent = `${window.SYMBOL} · 4小时（Yahoo Finance）`;
+
+// ---------- ZigZag：找出波段高低点 ----------
+// 价格从当前极值反向运动超过 th 才确认该极值为拐点；最后一个极值未确认（tentative）
+function zigzag(th) {
+  const piv = [];
+  let dir = 0, ext = 0;  // dir: 1 在找高点, -1 在找低点, 0 未定
+  let hiI = 0, loI = 0;
+  for (let i = 1; i < N; i++) {
+    const b = bars[i];
+    if (dir === 0) {
+      if (b.h > bars[hiI].h) hiI = i;
+      if (b.l < bars[loI].l) loI = i;
+      if (bars[hiI].h >= bars[loI].l * (1 + th) && hiI > loI) { piv.push({ i: loI, p: bars[loI].l, type: 'L' }); dir = 1; ext = hiI; }
+      else if (bars[loI].l <= bars[hiI].h * (1 - th) && loI > hiI) { piv.push({ i: hiI, p: bars[hiI].h, type: 'H' }); dir = -1; ext = loI; }
+    } else if (dir === 1) {
+      if (b.h >= bars[ext].h) ext = i;
+      else if (b.l <= bars[ext].h * (1 - th)) { piv.push({ i: ext, p: bars[ext].h, type: 'H' }); dir = -1; ext = i; }
+    } else {
+      if (b.l <= bars[ext].l) ext = i;
+      else if (b.h >= bars[ext].l * (1 + th)) { piv.push({ i: ext, p: bars[ext].l, type: 'L' }); dir = 1; ext = i; }
+    }
+  }
+  if (dir === 1) piv.push({ i: ext, p: bars[ext].h, type: 'H', tentative: true });
+  if (dir === -1) piv.push({ i: ext, p: bars[ext].l, type: 'L', tentative: true });
+  return piv;
+}
+
+// ---------- 识别三推（下跌找底 / 上涨找顶） ----------
+// 以下跌为例：起点 = 最近 LOOKBACK 根内的最高拐点；之后每创出一个新低的拐点算一推，
+// 两推之间取最高的反弹点（没创新低的小波动被跳过）。上涨方向完全镜像。
+// 至少两推才算形态；三推及以上视为"三推衰竭"。
+const LOOKBACK = 80;
+const DIRS = {
+  down: { start: 'H', push: 'L', name: '下跌', ext: '低', reb: '反弹', side: 1,
+          A: 'A：头肩底', B: 'B：W型双底or三推衰竭后的底', done: '三推衰竭，反弹目标',
+          hint: 'A 头肩底 或 B 第三推后筑底' },
+  up:   { start: 'L', push: 'H', name: '上涨', ext: '高', reb: '回调', side: -1,
+          A: 'A：头肩顶', B: 'B：M头or三推衰竭后的顶', done: '三推衰竭，回调目标',
+          hint: 'A 头肩顶 或 B 第三推后筑顶' },
+};
+function detectPushes(piv, dir) {
+  const d = DIRS[dir];
+  const beyond = (a, b) => (dir === 'down' ? a < b : a > b);       // a 比 b 更"推进"
+  const starts = piv.filter(p => p.type === d.start && p.i >= N - LOOKBACK);
+  if (!starts.length) return null;
+  const P0 = starts.reduce((a, b) => (beyond(b.p, a.p) ? a : b));  // 下跌取最高点，上涨取最低点
+  const seq = [P0];
+  let lastPush = null, reb = null;
+  for (const p of piv) {
+    if (p.i <= P0.i) continue;
+    if (p.type === d.push) {
+      if (lastPush && !beyond(p.p, lastPush.p)) continue;          // 没创新低/新高，不算一推
+      if (lastPush) seq.push(reb);
+      seq.push(p); lastPush = p; reb = null;
+    } else if (!reb || beyond(reb.p, p.p)) reb = p;                // 两推之间最大的反弹/回调
+  }
+  const pushes = seq.filter(p => p.type === d.push).length;
+  return pushes >= 2 ? { dir, seq, tail: reb, pushes, lastPush } : null;
+}
+
+// ---------- 由识别结果生成辅助线 ----------
+let pivots, pat, lines;
+const lineAt = (a, b) => x => a.p + (b.p - a.p) * (x - a.i) / (b.i - a.i);
+
+function analyze() {
+  const th = Math.max(0.2, +document.getElementById('th').value || 2) / 100;
+  const mode = document.getElementById('dir').value;
+  pivots = zigzag(th);
+  const found = (mode === 'auto' ? ['down', 'up'] : [mode]).map(d => detectPushes(pivots, d)).filter(Boolean);
+  // 自动模式：两个方向都识别到时，取最后一推更近的那个
+  pat = found.sort((a, b) => b.lastPush.i - a.lastPush.i)[0] || null;
+  lines = null;
+  const info = document.getElementById('info');
+  if (!pat) { info.textContent = '未识别到两推/三推形态，可调整 ZigZag 阈值或方向再试'; return; }
+
+  const { dir, seq, tail, pushes } = pat, d = DIRS[dir];
+  const rebs = seq.filter(p => p.type === d.start), pts = seq.filter(p => p.type === d.push);
+  const P0 = rebs[0], lastReb = rebs[rebs.length - 1];
+  const F1 = pts[0], lastP = pts[pts.length - 1];
+  const rebLine = lineAt(P0, lastReb), pushLine = lineAt(F1, lastP);
+  // 反弹/回调越过最后一个反弹点（颈线）：形态已兑现，不再推演
+  const broken = tail && (dir === 'down' ? tail.p > lastReb.p : tail.p < lastReb.p);
+  const endI = (broken ? lastP : tail || lastP).i + 6;
+  const rebSlope = (lastReb.p - P0.p) / (lastReb.i - P0.i), pushSlope = (lastP.p - F1.p) / (lastP.i - F1.i);
+
+  lines = {
+    side: d.side,                                   // 1：推点在下方（找底），-1：推点在上方（找顶）
+    edges: [[[P0.i, P0.p], [endI, rebLine(endI)]], [[F1.i, F1.p], [endI + 2, pushLine(endI + 2)]]],
+    levels: [lastReb.p, lastP.p],
+    push: (tail ? [...seq, tail] : seq).map(p => [p.i, p.p]),
+    labels: pts.map((p, k) => [p.i, p.p, `第${k + 1}推`]),
+    proj: [],
+  };
+
+  // range 带符号：下跌为正、上涨为负，推演路径的公式因此两个方向通用
+  const range = lastReb.p - lastP.p;
+  const fmt = p => `${bars[p.i].t.slice(5)} ${p.p.toFixed(2)}`;
+  let text = `识别到${d.name} ${pushes} 推：起点 ${fmt(P0)}，` +
+    pts.map((p, k) => `第${k + 1}推${d.ext}点 ${fmt(p)}`).join('，');
+  // 收敛：反弹线比推进线更陡
+  text += d.side * (rebSlope - pushSlope) < 0 ? `；${dir === 'down' ? '下降' : '上升'}收敛楔形` : '；通道不收敛';
+
+  if (broken) {
+    text += `；${d.reb}已${dir === 'down' ? '突破' : '跌破'}颈线 ${lastReb.p.toFixed(2)}，${dir === 'down' ? '底部' : '顶部'}形态已确认`;
+  } else if (pushes >= 3) {
+    // 三推完成：衰竭信号，经典目标为第三推起点（最后一个反弹/回调点）
+    const from = tail || lastP;
+    lines.proj.push({ path: [[from.i, from.p], [from.i + 8, lastReb.p + range * 0.2]], label: d.done });
+    text += '；三推完成，关注衰竭反转';
+  } else if (tail) {
+    // 两推 + 正在反弹/回调：A 头肩 / B 再走第三推后筑底(顶)
+    const T = tail;
+    lines.proj.push({ path: [[T.i, T.p], [T.i + 3, lastP.p + range * 0.35], [T.i + 9, lastReb.p + range * 0.6]],
+                      label: d.A });
+    lines.proj.push({ path: [[T.i, T.p], [T.i + 4, pushLine(T.i + 4)], [T.i + 11, lastP.p + range * 0.5],
+                             [T.i + 16, lastP.p + range * 0.3], [T.i + 22, lastReb.p]],
+                      label: d.B });
+    text += `；当前从第2推${d.reb}${tail.tentative ? '（未确认）' : ''}，可能走 ${d.hint}`;
+  } else {
+    text += '；第2推进行中';
+  }
+  info.textContent = text;
+}
+
+// ---------- 绘图 ----------
+const cvs = document.getElementById('c'), ctx = cvs.getContext('2d');
+const pad = { l: 10, r: 70, t: 20, b: 30 };
+let W, H, mouse = null;
+let visible = Math.min(N, 70);  // 可见K线根数，滚轮缩放
+let P_MIN, P_MAX, start;
+const show = { zig: false, wedge: true, push: true, proj: true };
+
+const span = () => visible + FUTURE;
+const step = () => (W - pad.l - pad.r) / span();
+const xOf = i => pad.l + (i - start + 0.5) * step();
+const yOf = p => pad.t + (P_MAX - p) * (H - pad.t - pad.b) / (P_MAX - P_MIN);
+const pOfY = y => P_MAX - (y - pad.t) * (P_MAX - P_MIN) / (H - pad.t - pad.b);
+
+function layout() {
+  start = N - visible;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = start; i < N; i++) { lo = Math.min(lo, bars[i].l); hi = Math.max(hi, bars[i].h); }
+  if (lines) for (const path of [...lines.edges, ...lines.proj.map(p => p.path)])
+    for (const [i, p] of path) if (i >= start) { lo = Math.min(lo, p); hi = Math.max(hi, p); }
+  const m = (hi - lo) * 0.06;
+  P_MIN = lo - m; P_MAX = hi + m;
+}
+
+function resize() {
+  const r = cvs.parentElement.getBoundingClientRect(), d = devicePixelRatio || 1;
+  W = r.width; H = r.height;
+  cvs.width = W * d; cvs.height = H * d;
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+  draw();
+}
+
+function poly(pts, color, width = 2, dash = []) {
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
+  ctx.beginPath();
+  pts.forEach(([i, p], k) => k ? ctx.lineTo(xOf(i), yOf(p)) : ctx.moveTo(xOf(i), yOf(p)));
+  ctx.stroke(); ctx.restore();
+}
+function arrowHead(pts, color) {
+  const [a, b] = [pts[pts.length - 2], pts[pts.length - 1]];
+  const x1 = xOf(a[0]), y1 = yOf(a[1]), x2 = xOf(b[0]), y2 = yOf(b[1]);
+  const ang = Math.atan2(y2 - y1, x2 - x1), s = 12;
+  ctx.save(); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+  ctx.moveTo(x2 - s * Math.cos(ang - 0.45), y2 - s * Math.sin(ang - 0.45));
+  ctx.lineTo(x2, y2);
+  ctx.lineTo(x2 - s * Math.cos(ang + 0.45), y2 - s * Math.sin(ang + 0.45));
+  ctx.stroke(); ctx.restore();
+}
+function text(t, x, y, color, align = 'left', size = 13) {
+  ctx.fillStyle = color; ctx.font = `${size}px "Microsoft YaHei", sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(t, x, y);
+}
+function niceStep(range) {
+  const raw = range / 8, mag = 10 ** Math.floor(Math.log10(raw));
+  return [1, 2, 2.5, 5, 10].map(f => f * mag).find(s => s >= raw);
+}
+
+function draw() {
+  layout();
+  ctx.clearRect(0, 0, W, H);
+  const plotR = W - pad.r, plotB = H - pad.b;
+
+  // 价格网格 + 右侧价格轴
+  ctx.strokeStyle = '#1f2430'; ctx.lineWidth = 1;
+  const ps = niceStep(P_MAX - P_MIN);
+  for (let p = Math.ceil(P_MIN / ps) * ps; p <= P_MAX; p += ps) {
+    const y = Math.round(yOf(p)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(plotR, y); ctx.stroke();
+    text(p.toFixed(ps < 1 ? 1 : 0), plotR + 8, y, '#787b86', 'left', 12);
+  }
+  // 时间轴：每隔若干根标一次日期
+  const every = Math.max(2, Math.ceil(80 / step() / 2) * 2);
+  for (let i = start; i < N; i++) {
+    if ((N - 1 - i) % every) continue;
+    const x = Math.round(xOf(i)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, plotB); ctx.stroke();
+    text(bars[i].t.slice(5, 10), x, plotB + 15, '#787b86', 'center', 12);
+  }
+
+  // 裁剪到绘图区
+  ctx.save(); ctx.beginPath(); ctx.rect(pad.l, pad.t, plotR - pad.l, plotB - pad.t); ctx.clip();
+
+  // K 线
+  const cw = Math.max(1, step() * 0.65);
+  let hiI = start, loI = start;
+  for (let i = start; i < N; i++) {
+    const b = bars[i], x = xOf(i), col = b.c >= b.o ? UP : DOWN;
+    if (b.h > bars[hiI].h) hiI = i;
+    if (b.l < bars[loI].l) loI = i;
+    ctx.strokeStyle = ctx.fillStyle = col; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, yOf(b.h)); ctx.lineTo(Math.round(x) + 0.5, yOf(b.l)); ctx.stroke();
+    const y0 = yOf(Math.max(b.o, b.c)), hh = Math.max(1, yOf(Math.min(b.o, b.c)) - y0);
+    ctx.fillRect(x - cw / 2, y0, cw, hh);
+  }
+
+  // 可见区最高/最低标注
+  const mark = (i, p, dy) => {
+    const x = xOf(i), y = yOf(p);
+    ctx.strokeStyle = '#d1d4dc'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 14, y + dy); ctx.stroke();
+    text(p.toFixed(3), x + 17, y + dy, '#d1d4dc', 'left', 12);
+  };
+  mark(hiI, bars[hiI].h, -10);
+  mark(loI, bars[loI].l, 10);
+
+  if (show.zig) poly(pivots.map(p => [p.i, p.p]), ORANGE, 1, [4, 3]);
+
+  if (lines) {
+    if (show.wedge) {
+      for (const lv of lines.levels) poly([[start - 1, lv], [N + FUTURE, lv]], GREY, 1.2);
+      for (const e of lines.edges) poly(e, GREY, 1.8);
+    }
+    if (show.push) {
+      poly(lines.push, BLUE, 2);
+      for (const [i, p, t] of lines.labels) text(t, xOf(i), yOf(p) + 16 * lines.side, BLUE, 'center', 12);
+    }
+    if (show.proj) for (const { path, label } of lines.proj) {
+      poly(path, BLUE, 2); arrowHead(path, BLUE);
+      const [i, p] = path[path.length - 1];
+      text(label, xOf(i) - 16, yOf(p) - 22 * lines.side, BLUE, 'right', 14);
+    }
+  }
+
+  // 最新价虚线
+  const lb = bars[N - 1], ly = yOf(lb.c), lc = lb.c >= lb.o ? UP : DOWN;
+  ctx.strokeStyle = lc; ctx.setLineDash([2, 3]);
+  ctx.beginPath(); ctx.moveTo(pad.l, ly); ctx.lineTo(plotR, ly); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 十字光标
+  const inPlot = mouse && mouse.x > pad.l && mouse.x < plotR && mouse.y > pad.t && mouse.y < plotB;
+  if (inPlot) {
+    ctx.strokeStyle = '#787b86'; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(mouse.x, pad.t); ctx.lineTo(mouse.x, plotB);
+    ctx.moveTo(pad.l, mouse.y); ctx.lineTo(plotR, mouse.y); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+
+  ctx.fillStyle = lc; ctx.fillRect(plotR, ly - 10, pad.r, 20);
+  text(lb.c.toFixed(2), plotR + 8, ly, '#fff', 'left', 12);
+  if (inPlot) {
+    ctx.fillStyle = '#363a45'; ctx.fillRect(plotR, mouse.y - 10, pad.r, 20);
+    text(pOfY(mouse.y).toFixed(2), plotR + 8, mouse.y, '#fff', 'left', 12);
+    const i = barAt(mouse.x);
+    if (i >= 0) {
+      ctx.fillStyle = '#363a45'; ctx.fillRect(mouse.x - 55, plotB + 4, 110, 20);
+      text(bars[i].t, mouse.x, plotB + 14, '#fff', 'center', 12);
+    }
+  }
+}
+
+function barAt(x) {
+  const i = start + Math.floor((x - pad.l) / step());
+  return i >= start && i < N ? i : -1;
+}
+function setOhlc(b) {
+  const f = v => v.toFixed(3), col = b.c >= b.o ? UP : DOWN;
+  const pb = bars[bars.indexOf(b) - 1], chg = pb ? (b.c / pb.c - 1) * 100 : 0;
+  document.getElementById('ohlc').innerHTML =
+    `${b.t} 开 <b style="color:${col}">${f(b.o)}</b> 高 <b style="color:${col}">${f(b.h)}</b> ` +
+    `低 <b style="color:${col}">${f(b.l)}</b> 收 <b style="color:${col}">${f(b.c)}</b> ` +
+    `<b style="color:${chg >= 0 ? UP : DOWN}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</b> ` +
+    `量 ${(b.v / 1e4).toFixed(2)}万`;
+}
+const lastEl = document.getElementById('last');
+lastEl.textContent = bars[N - 1].c.toFixed(3);
+lastEl.style.color = N > 1 && bars[N - 1].c < bars[N - 2].c ? DOWN : UP;
+setOhlc(bars[N - 1]);
+
+cvs.addEventListener('mousemove', e => {
+  const r = cvs.getBoundingClientRect();
+  mouse = { x: e.clientX - r.left, y: e.clientY - r.top };
+  const i = barAt(mouse.x);
+  setOhlc(bars[i >= 0 ? i : N - 1]);
+  draw();
+});
+cvs.addEventListener('mouseleave', () => { mouse = null; setOhlc(bars[N - 1]); draw(); });
+cvs.addEventListener('wheel', e => {
+  e.preventDefault();
+  visible = Math.max(20, Math.min(N, Math.round(visible * (e.deltaY > 0 ? 1.15 : 1 / 1.15))));
+  draw();
+}, { passive: false });
+[['tZig', 'zig'], ['tWedge', 'wedge'], ['tPush', 'push'], ['tProj', 'proj']].forEach(([id, k]) =>
+  document.getElementById(id).addEventListener('change', e => { show[k] = e.target.checked; draw(); }));
+for (const id of ['th', 'dir']) document.getElementById(id).addEventListener('input', () => { analyze(); draw(); });
+addEventListener('resize', resize);
+const qth = new URLSearchParams(location.search).get('th');
+if (qth) document.getElementById('th').value = qth;
+const qdir = new URLSearchParams(location.search).get('dir');
+if (qdir) document.getElementById('dir').value = qdir;
+analyze();
+resize();
+</script>
+</body>
+</html>
