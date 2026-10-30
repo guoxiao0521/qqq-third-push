@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>QQQ 4小时 · 三推形态</title>
+<title>三推形态</title>
 <style>
   html, body { margin: 0; height: 100%; background: #131722; color: #d1d4dc; overflow: hidden;
     font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
@@ -24,7 +24,7 @@
 </head>
 <body>
 <header>
-  <h1 id="title">QQQ · 4小时</h1>
+  <h1 id="title"></h1>
   <span class="price" id="last"></span>
   <span id="ohlc"></span>
   <div class="toggles">
@@ -39,20 +39,37 @@
 <div id="info"></div>
 <div id="wrap"><canvas id="c"></canvas></div>
 
-<!-- 真实数据：先运行 python fetch_data.py 生成 data.js -->
-<script src="data.js"></script>
+<!-- 数据：data/<代码>.js。本地先运行 python fetch_data.py <代码> 生成；线上由 Worker 现拉。
+     ?symbol=515880 看 A 股（6 位数字自动补 .SS/.SZ），不带参数默认 QQQ -->
+<script>
+let SYM = (new URLSearchParams(location.search).get('symbol') || 'QQQ').toUpperCase();
+if (/^\d{6}$/.test(SYM)) SYM += '569'.includes(SYM[0]) ? '.SS' : '.SZ';  // 沪市 5/6/9 开头，其余深市
+if (!/^[A-Z0-9.^=-]{1,12}$/.test(SYM)) SYM = 'QQQ';
+const qrange = new URLSearchParams(location.search).get('range');
+document.write(`<script src="data/${encodeURIComponent(SYM)}.js${qrange ? '?range=' + encodeURIComponent(qrange) : ''}"><\/script>`);
+</script>
 <script>
 const UP = '#ef5350', DOWN = '#26a69a', BLUE = '#4a7dff', GREY = '#9a9ea8', ORANGE = '#f0a030';  // 红涨绿跌
 const FUTURE = 26;  // 右侧留给推演路径的空位（根数）
 
 const bars = window.BARS || [];
 if (!bars.length) {
-  document.getElementById('wrap').innerHTML =
-    '<div id="err">没有找到 data.js。请先在本目录运行：<br><code>python fetch_data.py</code><br>然后刷新页面。</div>';
+  const wrap = document.getElementById('wrap');
+  const el = document.createElement('div');
+  el.id = 'err';
+  if (window.DATA_ERROR) {
+    el.textContent = window.DATA_ERROR;
+  } else {
+    el.innerHTML = `没有找到 data/${SYM}.js。请先在本目录运行：<br><code>python fetch_data.py ${SYM}</code><br>然后刷新页面。`;
+  }
+  wrap.replaceChildren(el);
   throw new Error('no data');
 }
 const N = bars.length;
-document.getElementById('title').textContent = `${window.SYMBOL} · 4小时（Yahoo Finance）`;
+const INTERVAL = window.INTERVAL || '4小时';
+document.getElementById('title').textContent = `${window.SYMBOL} · ${INTERVAL}（Yahoo Finance）`;
+document.title = `${window.SYMBOL} ${INTERVAL} · 三推形态`;
+const DP = bars[N - 1].c < 10 ? 3 : 2;  // 价格小数位：515880 这类几毛钱的 ETF 要 3 位
 
 // ---------- ZigZag：找出波段高低点 ----------
 // 价格从当前极值反向运动超过 th 才确认该极值为拐点；最后一个极值未确认（tentative）
@@ -149,14 +166,14 @@ function analyze() {
 
   // range 带符号：下跌为正、上涨为负，推演路径的公式因此两个方向通用
   const range = lastReb.p - lastP.p;
-  const fmt = p => `${bars[p.i].t.slice(5)} ${p.p.toFixed(2)}`;
+  const fmt = p => `${bars[p.i].t.slice(5)} ${p.p.toFixed(DP)}`;
   let text = `识别到${d.name} ${pushes} 推：起点 ${fmt(P0)}，` +
     pts.map((p, k) => `第${k + 1}推${d.ext}点 ${fmt(p)}`).join('，');
   // 收敛：反弹线比推进线更陡
   text += d.side * (rebSlope - pushSlope) < 0 ? `；${dir === 'down' ? '下降' : '上升'}收敛楔形` : '；通道不收敛';
 
   if (broken) {
-    text += `；${d.reb}已${dir === 'down' ? '突破' : '跌破'}颈线 ${lastReb.p.toFixed(2)}，${dir === 'down' ? '底部' : '顶部'}形态已确认`;
+    text += `；${d.reb}已${dir === 'down' ? '突破' : '跌破'}颈线 ${lastReb.p.toFixed(DP)}，${dir === 'down' ? '底部' : '顶部'}形态已确认`;
   } else if (pushes >= 3) {
     // 三推完成：衰竭信号，经典目标为第三推起点（最后一个反弹/回调点）
     const from = tail || lastP;
@@ -234,6 +251,13 @@ function niceStep(range) {
   return [1, 2, 2.5, 5, 10].map(f => f * mag).find(s => s >= raw);
 }
 
+// 刻度步长需要几位小数：2.5 → 1，0.025 → 3
+function stepDp(s) {
+  let d = 0;
+  while (d < 6 && Math.abs(s * 10 ** d - Math.round(s * 10 ** d)) > 1e-6) d++;
+  return d;
+}
+
 function draw() {
   layout();
   ctx.clearRect(0, 0, W, H);
@@ -245,7 +269,7 @@ function draw() {
   for (let p = Math.ceil(P_MIN / ps) * ps; p <= P_MAX; p += ps) {
     const y = Math.round(yOf(p)) + 0.5;
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(plotR, y); ctx.stroke();
-    text(p.toFixed(ps < 1 ? 1 : 0), plotR + 8, y, '#787b86', 'left', 12);
+    text(p.toFixed(stepDp(ps)), plotR + 8, y, '#787b86', 'left', 12);
   }
   // 时间轴：每隔若干根标一次日期
   const every = Math.max(2, Math.ceil(80 / step() / 2) * 2);
@@ -317,10 +341,10 @@ function draw() {
   ctx.restore();
 
   ctx.fillStyle = lc; ctx.fillRect(plotR, ly - 10, pad.r, 20);
-  text(lb.c.toFixed(2), plotR + 8, ly, '#fff', 'left', 12);
+  text(lb.c.toFixed(DP), plotR + 8, ly, '#fff', 'left', 12);
   if (inPlot) {
     ctx.fillStyle = '#363a45'; ctx.fillRect(plotR, mouse.y - 10, pad.r, 20);
-    text(pOfY(mouse.y).toFixed(2), plotR + 8, mouse.y, '#fff', 'left', 12);
+    text(pOfY(mouse.y).toFixed(DP), plotR + 8, mouse.y, '#fff', 'left', 12);
     const i = barAt(mouse.x);
     if (i >= 0) {
       ctx.fillStyle = '#363a45'; ctx.fillRect(mouse.x - 55, plotB + 4, 110, 20);
@@ -340,7 +364,7 @@ function setOhlc(b) {
     `${b.t} 开 <b style="color:${col}">${f(b.o)}</b> 高 <b style="color:${col}">${f(b.h)}</b> ` +
     `低 <b style="color:${col}">${f(b.l)}</b> 收 <b style="color:${col}">${f(b.c)}</b> ` +
     `<b style="color:${chg >= 0 ? UP : DOWN}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</b> ` +
-    `量 ${(b.v / 1e4).toFixed(2)}万`;
+    `量 ${b.v >= 1e8 ? (b.v / 1e8).toFixed(2) + '亿' : (b.v / 1e4).toFixed(2) + '万'}`;
 }
 const lastEl = document.getElementById('last');
 lastEl.textContent = bars[N - 1].c.toFixed(3);
